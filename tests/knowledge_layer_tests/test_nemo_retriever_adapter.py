@@ -343,6 +343,7 @@ def test_service_environment_and_explicit_backend_config_are_equivalent(monkeypa
         "NRL_RERANK_TOP_K": "5",
         "NRL_RERANK_URL": "https://rerank.example.test/v1/ranking",
         "NRL_RERANK_MODEL": "custom-rerank-model",
+        "NRL_RERANK_ALLOWED_HOSTS": "rerank.example.test",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -364,6 +365,7 @@ def test_service_environment_and_explicit_backend_config_are_equivalent(monkeypa
             "nrl_rerank_top_k": values["NRL_RERANK_TOP_K"],
             "nrl_rerank_url": values["NRL_RERANK_URL"],
             "nrl_rerank_model": values["NRL_RERANK_MODEL"],
+            "nrl_rerank_allowed_hosts": values["NRL_RERANK_ALLOWED_HOSTS"],
         }
     )
     public_config = KnowledgeRetrievalConfig(backend="nemo_retriever")
@@ -372,6 +374,77 @@ def test_service_environment_and_explicit_backend_config_are_equivalent(monkeypa
     assert adapter_module._settings(public_config.backend_config) == from_environment
     assert values["NRL_API_TOKEN"] not in repr(public_config)
     assert "environment-secret" not in repr(from_environment)
+
+
+def test_nrl_rerank_url_requires_https_allowlist_and_secure_client(monkeypatch):
+    base = {
+        "base_url": "https://nrl.example.test",
+        "scope": "workspace-123",
+        "enable_nrl_rerank": True,
+        "verify_ssl": False,
+    }
+    with pytest.raises(ValueError, match="absolute HTTPS URL"):
+        adapter_module._settings({**base, "nrl_rerank_url": "http://ai.api.nvidia.com/v1/ranking"})
+    with pytest.raises(ValueError, match="not allowlisted"):
+        adapter_module._settings({**base, "nrl_rerank_url": "https://evil.example.test/v1/ranking"})
+    with pytest.raises(ValueError, match="absolute HTTPS URL"):
+        adapter_module._settings(
+            {
+                **base,
+                "nrl_rerank_url": "https://user:token@ai.api.nvidia.com/v1/ranking",
+            }
+        )
+
+    settings = adapter_module._settings(
+        {
+            **base,
+            "nrl_rerank_url": "https://rerank.example.test/v1/ranking",
+            "nrl_rerank_allowed_hosts": "rerank.example.test",
+            "nrl_rerank_api_key": SecretStr("rerank-secret"),
+        }
+    )
+    assert settings.verify_ssl is False
+    assert "rerank.example.test" in settings.nrl_rerank_allowed_hosts
+    assert adapter_module._DEFAULT_RERANK_HOST.lower() in settings.nrl_rerank_allowed_hosts
+
+    captured: dict[str, Any] = {}
+    requests: list[httpx.Request] = []
+
+    def reranker(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"rankings": [{"index": 0, "logit": 1.0}]})
+
+    async_client = httpx.AsyncClient
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return async_client(transport=httpx.MockTransport(reranker), **kwargs)
+
+    monkeypatch.setattr(adapter_module.httpx, "AsyncClient", factory)
+    hits = asyncio.run(
+        adapter_module._rerank_hits(
+            "findings",
+            [
+                adapter_module.QueryHitWire.model_validate(
+                    {
+                        "chunk_id": "chunk-1",
+                        "document_id": "doc-1",
+                        "text": "body",
+                        "distance": 0.1,
+                        "filename": "report.pdf",
+                    }
+                )
+            ],
+            1,
+            settings,
+        )
+    )
+
+    assert hits[0].chunk_id == "chunk-1"
+    assert captured["verify"] is True
+    assert captured["follow_redirects"] is False
+    assert str(requests[0].url) == "https://rerank.example.test/v1/ranking"
+    assert requests[0].headers["Authorization"] == "Bearer rerank-secret"
 
 
 def test_service_upload_queue_bound_accepts_zero_and_rejects_negative() -> None:
@@ -881,6 +954,7 @@ def test_rerank_reorders_hits_and_fails_closed(monkeypatch):
             "nrl_rerank_top_k": 2,
             "nrl_rerank_url": "https://rerank.example.test/v1/ranking",
             "nrl_rerank_model": "custom-rerank-model",
+            "nrl_rerank_allowed_hosts": "rerank.example.test",
             "nrl_rerank_api_key": SecretStr("rerank-secret"),
         }
     )
@@ -902,6 +976,52 @@ def test_rerank_reorders_hits_and_fails_closed(monkeypatch):
     failed = asyncio.run(NemoRetrieverRetriever(config).retrieve("findings", "test", top_k=3))
     assert not failed.success
     assert "scored 1 of 3" in (failed.error_message or "")
+
+    response_body["rankings"] = [
+        {"index": 0, "logit": 1.0},
+        {"index": 1, "logit": 2.0},
+        {"index": 2, "logit": 0.5},
+        {"index": 0, "logit": 9.0},
+    ]
+    duplicated = asyncio.run(NemoRetrieverRetriever(config).retrieve("findings", "test", top_k=3))
+    assert not duplicated.success
+    assert "invalid" in (duplicated.error_message or "")
+
+
+def test_retrieve_skips_rerank_when_api_key_is_missing(monkeypatch):
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.delenv("NRL_RERANK_API_KEY", raising=False)
+    reranker_calls = 0
+
+    async def unexpected_reranker(*_args, **_kwargs):
+        nonlocal reranker_calls
+        reranker_calls += 1
+        raise AssertionError("reranker should not run without an API key")
+
+    fake = FakeNRL()
+    fake.query_hits = [
+        {
+            "chunk_id": f"chunk-{index}",
+            "document_id": "doc-1",
+            "text": f"text {index}",
+            "distance": float(index),
+            "filename": "report.pdf",
+        }
+        for index in range(3)
+    ]
+    config = _adapter_config(fake)
+    config.update(
+        {
+            "enable_nrl_rerank": True,
+            "nrl_rerank_top_k": 1,
+            "_reranker": unexpected_reranker,
+        }
+    )
+    result = asyncio.run(NemoRetrieverRetriever(config).retrieve("findings", "test", top_k=3))
+
+    assert result.success
+    assert reranker_calls == 0
+    assert [chunk.chunk_id for chunk in result.chunks] == ["chunk-0", "chunk-1", "chunk-2"]
 
 
 @pytest.mark.parametrize("distance", [float("nan"), float("inf"), float("-inf")])

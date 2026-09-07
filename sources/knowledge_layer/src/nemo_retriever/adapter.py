@@ -78,6 +78,7 @@ _JOB_PAGE_SIZE = 1000
 _PUBLIC_DOCUMENT_ERROR = "NeMo Retriever document ingestion failed"
 _RERANK_URL = "https://ai.api.nvidia.com/v1/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking"
 _RERANK_MODEL = "nvidia/llama-nemotron-rerank-vl-1b-v2"
+_DEFAULT_RERANK_HOST = urlparse(_RERANK_URL).hostname or "ai.api.nvidia.com"
 _DEFAULT_RERANK_TOP_K = 5
 _SERVICE_CONFIG_KEYS = frozenset(
     {
@@ -97,6 +98,7 @@ _SERVICE_CONFIG_KEYS = frozenset(
         "nrl_rerank_url",
         "nrl_rerank_model",
         "nrl_rerank_api_key",
+        "nrl_rerank_allowed_hosts",
     }
 )
 _SUCCESS_STATUSES = frozenset({"completed", "indexed", "ready", "success", "succeeded"})
@@ -124,6 +126,7 @@ class _Settings:
     nrl_rerank_url: str
     nrl_rerank_model: str
     nrl_rerank_api_key: SecretStr | None
+    nrl_rerank_allowed_hosts: tuple[str, ...]
     warm_start: bool
     start_ttl_cleanup: bool
 
@@ -170,6 +173,32 @@ def _config_value(config: dict[str, Any], key: str, env_name: str, default: Any 
     return value if value not in (None, "") else default
 
 
+def _host_list(value: Any) -> tuple[str, ...]:
+    if value in (None, ""):
+        items: list[str] = []
+    elif isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        items = [str(item) for item in value]
+    else:
+        items = [str(value)]
+    return tuple(dict.fromkeys(host.strip().lower() for host in items if str(host).strip()))
+
+
+def _rerank_allowed_hosts(config: dict[str, Any]) -> tuple[str, ...]:
+    extra = _host_list(_config_value(config, "nrl_rerank_allowed_hosts", "NRL_RERANK_ALLOWED_HOSTS", ""))
+    return tuple(dict.fromkeys((_DEFAULT_RERANK_HOST.lower(), *extra)))
+
+
+def _validate_nrl_rerank_url(url: str, allowed_hosts: tuple[str, ...]) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None or parsed.password is not None:
+        raise ValueError("nrl_rerank_url must be an absolute HTTPS URL")
+    host = (parsed.hostname or "").lower()
+    if host not in allowed_hosts:
+        raise ValueError("nrl_rerank_url host is not allowlisted")
+
+
 def _settings(config: dict[str, Any]) -> _Settings:
     base_url = str(_config_value(config, "base_url", "NRL_BASE_URL", "http://127.0.0.1:7670")).strip().rstrip("/")
     parsed = urlparse(base_url)
@@ -191,6 +220,7 @@ def _settings(config: dict[str, Any]) -> _Settings:
     nrl_rerank_top_k = int(_config_value(config, "nrl_rerank_top_k", "NRL_RERANK_TOP_K", _DEFAULT_RERANK_TOP_K))
     nrl_rerank_url = str(_config_value(config, "nrl_rerank_url", "NRL_RERANK_URL", _RERANK_URL)).strip()
     nrl_rerank_model = str(_config_value(config, "nrl_rerank_model", "NRL_RERANK_MODEL", _RERANK_MODEL)).strip()
+    nrl_rerank_allowed_hosts = _rerank_allowed_hosts(config)
     if connect_timeout_s <= 0 or request_timeout_s <= 0:
         raise ValueError("NeMo Retriever timeouts must be greater than zero")
     if max_retries < 0:
@@ -203,9 +233,8 @@ def _settings(config: dict[str, Any]) -> _Settings:
         raise ValueError("nrl_collection_ttl_hours must be greater than zero")
     if nrl_rerank_top_k < 1:
         raise ValueError("nrl_rerank_top_k must be at least one")
-    rerank_parsed = urlparse(nrl_rerank_url)
-    if enable_nrl_rerank and (rerank_parsed.scheme not in {"http", "https"} or not rerank_parsed.netloc):
-        raise ValueError("nrl_rerank_url must be an absolute HTTP(S) URL")
+    if enable_nrl_rerank:
+        _validate_nrl_rerank_url(nrl_rerank_url, nrl_rerank_allowed_hosts)
     if enable_nrl_rerank and not nrl_rerank_model:
         raise ValueError("nrl_rerank_model must not be empty")
     return _Settings(
@@ -231,6 +260,7 @@ def _settings(config: dict[str, Any]) -> _Settings:
         nrl_rerank_top_k=nrl_rerank_top_k,
         nrl_rerank_url=nrl_rerank_url,
         nrl_rerank_model=nrl_rerank_model,
+        nrl_rerank_allowed_hosts=nrl_rerank_allowed_hosts,
         nrl_rerank_api_key=(
             SecretStr(rerank_api_key)
             if (
@@ -272,6 +302,7 @@ def normalize_backend_config(config: dict[str, object]) -> dict[str, object]:
         "nrl_rerank_url": settings.nrl_rerank_url,
         "nrl_rerank_model": settings.nrl_rerank_model,
         "nrl_rerank_api_key": settings.nrl_rerank_api_key,
+        "nrl_rerank_allowed_hosts": settings.nrl_rerank_allowed_hosts,
     }
 
 
@@ -293,8 +324,13 @@ async def _rerank_hits(
     headers = {"Accept": "application/json"}
     if api_key := _secret_value(settings.nrl_rerank_api_key):
         headers["Authorization"] = f"Bearer {api_key}"
+    _validate_nrl_rerank_url(settings.nrl_rerank_url, settings.nrl_rerank_allowed_hosts)
     try:
-        async with httpx.AsyncClient(timeout=settings.request_timeout_s, verify=settings.verify_ssl) as client:
+        async with httpx.AsyncClient(
+            timeout=settings.request_timeout_s,
+            verify=True,
+            follow_redirects=False,
+        ) as client:
             response = await client.post(settings.nrl_rerank_url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
@@ -302,7 +338,13 @@ async def _rerank_hits(
         raise NemoRetrieverError("NeMo Retriever candidate reranking failed") from error
 
     try:
-        scores = {int(item["index"]): float(item["logit"]) for item in data["rankings"]}
+        scores: dict[int, float] = {}
+        for item in data["rankings"]:
+            index = int(item["index"])
+            logit = float(item["logit"])
+            if index in scores:
+                raise ValueError("duplicate ranking index")
+            scores[index] = logit
     except (KeyError, TypeError, ValueError) as error:
         raise NemoRetrieverError("NeMo Retriever reranker response was invalid") from error
     if set(scores) != set(range(len(hits))):
@@ -513,7 +555,7 @@ class NemoRetrieverRetriever(BaseRetriever):
             if len(response.results) != 1:
                 raise NemoRetrieverError("NeMo Retriever query returned an unexpected number of result sets")
             hits = response.results[0].hits
-            if self._settings.enable_nrl_rerank:
+            if self._settings.enable_nrl_rerank and _secret_value(self._settings.nrl_rerank_api_key):
                 hits = await self._reranker(query, hits, self._settings.nrl_rerank_top_k, self._settings)
             else:
                 hits = hits[:top_k]

@@ -328,6 +328,7 @@ functions:
       nrl_rerank_top_k: ${NRL_RERANK_TOP_K:-5}
       nrl_rerank_url: ${NRL_RERANK_URL:-https://ai.api.nvidia.com/v1/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking}
       nrl_rerank_model: ${NRL_RERANK_MODEL:-nvidia/llama-nemotron-rerank-vl-1b-v2}
+      nrl_rerank_allowed_hosts: ${NRL_RERANK_ALLOWED_HOSTS:-}
 ```
 
 Use [`configs/config_web_nemo_retriever.yml`](../../../configs/config_web_nemo_retriever.yml)
@@ -348,7 +349,11 @@ Per-attempt IDs remain diagnostic metadata. Query filters are rejected until
 the public NRL query contract supports them. Retrieval queries enable rerank
 by default: the adapter fetches the current `top_k` dense hits, calls
 `NRL_RERANK_URL` with `NRL_RERANK_MODEL`, and returns `nrl_rerank_top_k` hits (default 5).
+The ranking endpoint must be HTTPS. Custom hosts require
+`NRL_RERANK_ALLOWED_HOSTS` (the default NVIDIA host is always allowed). Bearer-token
+ranking requests keep TLS verification enabled and do not follow redirects.
 A ranking failure fails retrieval rather than silently returning dense results.
+If ranking is enabled but no ranking API key is configured, dense hits are returned unchanged.
 Set `ENABLE_NRL_RERANK=false` for dense retrieval only. AI-Q does not expose NRL extraction or indexing pipeline
 tuning and does not consume physical VectorDB names or LanceDB locations.
 Automatic transport retries are limited to reads and explicitly idempotent
@@ -725,6 +730,7 @@ Configuration values are resolved in the following order (highest to lowest prio
 | `ENABLE_NRL_RERANK` | nemo_retriever | Query rerank toggle (default true) |
 | `NRL_RERANK_TOP_K` | nemo_retriever | Hits kept after rerank (default 5); candidates come from the current query `top_k` |
 | `NRL_RERANK_URL`, `NRL_RERANK_MODEL` | nemo_retriever | Ranking endpoint and model; default is NVIDIA's hosted Llama Nemotron VL reranker |
+| `NRL_RERANK_ALLOWED_HOSTS` | nemo_retriever | Comma-separated extra ranking hosts; the default NVIDIA host is always allowed |
 | `NRL_RERANK_API_KEY` | nemo_retriever | Ranking endpoint bearer token; falls back to `NVIDIA_API_KEY` |
 | `NRL_VERIFY_SSL`, `NRL_CA_BUNDLE` | nemo_retriever | TLS verification and optional enterprise CA bundle |
 | `NRL_LOCAL_DATA_DIR`, `NRL_LOCAL_PROFILE` | nemo_retriever_local | Embedded data directory and NRL `auto` or `fast-text` profile |
